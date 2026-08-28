@@ -6,9 +6,9 @@ import re
 
 app = FastAPI()
 
-SAFE_INT_MAX = 9007199254740991
+MAX_SAFE_INT = 9007199254740991
 
-TS_RE = re.compile(
+TIMESTAMP_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T"
     r"\d{2}:\d{2}:\d{2}"
     r"(?:\.\d{1,3})?"
@@ -23,11 +23,11 @@ def invalid_input():
     )
 
 
-def parse_timestamp(value):
+def parse_instant(value):
     if not isinstance(value, str):
         return None
 
-    if not TS_RE.fullmatch(value):
+    if not TIMESTAMP_PATTERN.fullmatch(value):
         return None
 
     try:
@@ -45,7 +45,7 @@ def parse_timestamp(value):
         return None
 
 
-def finite_number(value):
+def finite(value):
     return (
         isinstance(value, (int, float))
         and not isinstance(value, bool)
@@ -53,11 +53,11 @@ def finite_number(value):
     )
 
 
-def safe_integer(value):
+def nonnegative_safe_integer(value):
     return (
         isinstance(value, int)
         and not isinstance(value, bool)
-        and 0 <= value <= SAFE_INT_MAX
+        and 0 <= value <= MAX_SAFE_INT
     )
 
 
@@ -69,49 +69,42 @@ def canonical_version(value):
         return False
 
     try:
-        n = int(value)
-        return 1 <= n <= SAFE_INT_MAX
+        number = int(value)
+        return 1 <= number <= MAX_SAFE_INT
     except Exception:
         return False
 
 
-def add_gate(failed, version, code):
-    failed.setdefault(version, set()).add(code)
+def add_gate(failed, version, gate):
+    failed.setdefault(version, set()).add(gate)
 
 
-def sorted_utf8(values):
+def utf8_sorted(values):
     return sorted(
         set(values),
         key=lambda x: x.encode("utf-8")
     )
 
 
-def make_failed(failed, input_versions):
-    """
-    The response must contain every input version.
-    Versions with no failures have [].
-    """
+def format_failed_gates(failed):
     output = {}
 
-    for version in input_versions:
-        if version not in output:
-            output[version] = []
+    for version, gates in failed.items():
 
-        if version in failed:
-            output[version] = sorted_utf8(
-                failed[version]
-            )
+        if not gates:
+            continue
+
+        output[version] = utf8_sorted(gates)
 
     return output
 
 
-def response(
+def make_response(
     action,
     champion,
     selected,
     eligible,
     failed,
-    input_versions,
     mutation,
     evidence
 ):
@@ -120,20 +113,17 @@ def response(
         "championVersion": champion,
         "selectedVersion": selected,
         "eligibleVersions": eligible,
-        "failedGates": make_failed(
-            failed,
-            input_versions
-        ),
+        "failedGates": format_failed_gates(failed),
         "aliasMutation": mutation,
         "evidence": evidence
     }
 
 
 @app.get("/")
-async def root():
+async def home():
     return {
         "status": "ok",
-        "service": "MLflow Model Promotion Gate"
+        "service": "MLflow Promotion Gate"
     }
 
 
@@ -146,7 +136,7 @@ async def health():
 async def promote(request: Request):
 
     # =========================================================
-    # INPUT
+    # REQUEST VALIDATION
     # =========================================================
 
     try:
@@ -178,7 +168,7 @@ async def promote(request: Request):
     if not isinstance(body["asOf"], str):
         return invalid_input()
 
-    as_of = parse_timestamp(body["asOf"])
+    as_of = parse_instant(body["asOf"])
 
     if as_of is None:
         return invalid_input()
@@ -188,30 +178,102 @@ async def promote(request: Request):
     champion = body["championVersion"]
 
     # =========================================================
-    # PRESERVE EVERY INPUT VERSION FOR failedGates
+    # POLICY VALIDATION
     # =========================================================
 
-    input_versions = []
+    if not isinstance(policy, dict):
+        return invalid_input()
 
-    for item in versions:
-        if isinstance(item, dict):
-            v = item.get("version")
+    required_policy = [
+        "datasetDigest",
+        "schemaDigest",
+        "maxAgeSeconds",
+        "accuracyFloor",
+        "requiredSlices",
+        "maxLatencyMs",
+        "maxSizeBytes",
+        "minImprovement"
+    ]
 
-            if isinstance(v, str):
-                input_versions.append(v)
-            else:
-                input_versions.append("<invalid>")
-        else:
-            input_versions.append("<invalid>")
+    for field in required_policy:
+        if field not in policy:
+            return invalid_input()
+
+    if (
+        not isinstance(policy["datasetDigest"], str)
+        or policy["datasetDigest"] == ""
+    ):
+        return invalid_input()
+
+    if (
+        not isinstance(policy["schemaDigest"], str)
+        or policy["schemaDigest"] == ""
+    ):
+        return invalid_input()
+
+    if not nonnegative_safe_integer(
+        policy["maxAgeSeconds"]
+    ):
+        return invalid_input()
+
+    if (
+        not finite(policy["accuracyFloor"])
+        or policy["accuracyFloor"] < 0
+        or policy["accuracyFloor"] > 1
+    ):
+        return invalid_input()
+
+    if not isinstance(
+        policy["requiredSlices"],
+        dict
+    ):
+        return invalid_input()
+
+    if (
+        not finite(policy["maxLatencyMs"])
+        or policy["maxLatencyMs"] < 0
+    ):
+        return invalid_input()
+
+    if not nonnegative_safe_integer(
+        policy["maxSizeBytes"]
+    ):
+        return invalid_input()
+
+    if (
+        not finite(policy["minImprovement"])
+        or policy["minImprovement"] < 0
+        or policy["minImprovement"] > 1
+    ):
+        return invalid_input()
+
+    for name, floor in policy[
+        "requiredSlices"
+    ].items():
+
+        if not isinstance(name, str):
+            return invalid_input()
+
+        if (
+            not finite(floor)
+            or floor < 0
+            or floor > 1
+        ):
+            return invalid_input()
+
+    # =========================================================
+    # INITIAL FAILED GATES
+    # =========================================================
 
     failed = {}
 
     # =========================================================
-    # VERSION VALIDATION
+    # CANONICAL VERSION CHECK
     # =========================================================
 
     counts = {}
-    canonical_items = []
+
+    valid_items = []
 
     for item in versions:
 
@@ -243,21 +305,24 @@ async def promote(request: Request):
 
             continue
 
-        counts[version] = counts.get(
-            version,
-            0
-        ) + 1
+        counts[version] = (
+            counts.get(version, 0) + 1
+        )
 
-        canonical_items.append(item)
+        valid_items.append(item)
 
-    # Every occurrence of a duplicate is invalid.
-    duplicate_versions = {
+    # =========================================================
+    # DUPLICATES
+    # =========================================================
+
+    duplicates = {
         version
         for version, count in counts.items()
         if count > 1
     }
 
-    for version in duplicate_versions:
+    for version in duplicates:
+
         add_gate(
             failed,
             version,
@@ -265,130 +330,7 @@ async def promote(request: Request):
         )
 
     # =========================================================
-    # POLICY VALIDATION
-    # =========================================================
-
-    policy_valid = isinstance(policy, dict)
-
-    required_policy_fields = [
-        "datasetDigest",
-        "schemaDigest",
-        "maxAgeSeconds",
-        "accuracyFloor",
-        "requiredSlices",
-        "maxLatencyMs",
-        "maxSizeBytes",
-        "minImprovement"
-    ]
-
-    if policy_valid:
-
-        for field in required_policy_fields:
-
-            if field not in policy:
-                policy_valid = False
-                break
-
-    if policy_valid:
-
-        if (
-            not isinstance(
-                policy["datasetDigest"],
-                str
-            )
-            or policy["datasetDigest"] == ""
-        ):
-            policy_valid = False
-
-        if (
-            not isinstance(
-                policy["schemaDigest"],
-                str
-            )
-            or policy["schemaDigest"] == ""
-        ):
-            policy_valid = False
-
-        if not safe_integer(
-            policy["maxAgeSeconds"]
-        ):
-            policy_valid = False
-
-        if (
-            not finite_number(
-                policy["accuracyFloor"]
-            )
-            or not 0 <= policy["accuracyFloor"] <= 1
-        ):
-            policy_valid = False
-
-        if not isinstance(
-            policy["requiredSlices"],
-            dict
-        ):
-            policy_valid = False
-
-        if (
-            not finite_number(
-                policy["maxLatencyMs"]
-            )
-            or policy["maxLatencyMs"] < 0
-        ):
-            policy_valid = False
-
-        if not safe_integer(
-            policy["maxSizeBytes"]
-        ):
-            policy_valid = False
-
-        if (
-            not finite_number(
-                policy["minImprovement"]
-            )
-            or not 0 <= policy["minImprovement"] <= 1
-        ):
-            policy_valid = False
-
-    if policy_valid:
-
-        for name, floor in policy[
-            "requiredSlices"
-        ].items():
-
-            if not isinstance(name, str):
-                policy_valid = False
-                break
-
-            if (
-                not finite_number(floor)
-                or floor < 0
-                or floor > 1
-            ):
-                policy_valid = False
-                break
-
-    if not policy_valid:
-
-        for version in counts:
-            add_gate(
-                failed,
-                version,
-                "INVALID_POLICY"
-            )
-
-        return response(
-            "block",
-            champion,
-            None,
-            [],
-            failed,
-            input_versions,
-            None,
-            None
-        )
-
-    # =========================================================
-    # CHAMPION VALIDATION
+    # CHAMPION MUST BE VALID AND UNIQUE
     # =========================================================
 
     if not canonical_version(champion):
@@ -399,54 +341,51 @@ async def promote(request: Request):
             "INVALID_VERSION"
         )
 
-        return response(
+        return make_response(
             "block",
             champion,
             None,
             [],
             failed,
-            input_versions,
             None,
             None
         )
 
     if champion not in counts:
 
-        return response(
+        return make_response(
             "block",
             champion,
             None,
             [],
             failed,
-            input_versions,
             None,
             None
         )
 
-    if champion in duplicate_versions:
+    if champion in duplicates:
 
-        return response(
+        return make_response(
             "block",
             champion,
             None,
             [],
             failed,
-            input_versions,
             None,
             None
         )
 
     # =========================================================
-    # LOOKUP MAP ONLY AFTER DUPLICATE VALIDATION
+    # LOOKUP MAP
     # =========================================================
 
     lookup = {}
 
-    for item in canonical_items:
+    for item in valid_items:
 
         version = item["version"]
 
-        if version in duplicate_versions:
+        if version in duplicates:
             continue
 
         lookup[version] = item
@@ -459,12 +398,16 @@ async def promote(request: Request):
     )
 
     # =========================================================
-    # EVIDENCE VALIDATION
+    # EVIDENCE GATE
     # =========================================================
 
-    def validate(item):
+    def evaluate(item):
 
         gates = set()
+
+        # -----------------------------------------------------
+        # EVALUATION
+        # -----------------------------------------------------
 
         if "evaluation" not in item:
             gates.add("MISSING_EVALUATION")
@@ -484,7 +427,7 @@ async def promote(request: Request):
             "createdAt"
         )
 
-        created = parse_timestamp(
+        created = parse_instant(
             created_at
         )
 
@@ -516,65 +459,50 @@ async def promote(request: Request):
             "sizeBytes"
         )
 
-        accuracy_finite = finite_number(
-            accuracy
-        )
+        # Accuracy
+        if not finite(accuracy):
 
-        latency_finite = finite_number(
-            latency
-        )
-
-        size_finite = finite_number(
-            size
-        )
-
-        if not accuracy_finite:
             gates.add("NON_FINITE")
 
-        if not latency_finite:
+        elif accuracy < 0 or accuracy > 1:
+
+            gates.add("METRIC_RANGE")
+
+        # Latency
+        if not finite(latency):
+
             gates.add("NON_FINITE")
 
-        if not size_finite:
+        elif latency < 0:
+
+            gates.add("METRIC_RANGE")
+
+        # Size
+        if not finite(size):
+
             gates.add("NON_FINITE")
 
-        # -----------------------------------------------------
-        # RANGE VALIDATION
-        # -----------------------------------------------------
+        elif (
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or size > MAX_SAFE_INT
+        ):
 
-        if accuracy_finite:
-
-            if accuracy < 0 or accuracy > 1:
-                gates.add("METRIC_RANGE")
-
-        if latency_finite:
-
-            if latency < 0:
-                gates.add("METRIC_RANGE")
-
-        if size_finite:
-
-            if (
-                not isinstance(size, int)
-                or isinstance(size, bool)
-                or size < 0
-                or size > SAFE_INT_MAX
-            ):
-                gates.add("METRIC_RANGE")
+            gates.add("METRIC_RANGE")
 
         # -----------------------------------------------------
-        # IMMUTABLE ARTIFACT LINEAGE
+        # ARTIFACT LINEAGE
         # -----------------------------------------------------
 
-        registered_artifact = item.get(
-            "artifactDigest"
-        )
+        if (
+            evaluation.get("artifactDigest")
+            != item.get("artifactDigest")
+        ):
 
-        evidence_artifact = evaluation.get(
-            "artifactDigest"
-        )
-
-        if evidence_artifact != registered_artifact:
-            gates.add("ARTIFACT_MISMATCH")
+            gates.add(
+                "ARTIFACT_MISMATCH"
+            )
 
         # -----------------------------------------------------
         # DATASET LINEAGE
@@ -584,7 +512,10 @@ async def promote(request: Request):
             evaluation.get("datasetDigest")
             != policy["datasetDigest"]
         ):
-            gates.add("DATASET_MISMATCH")
+
+            gates.add(
+                "DATASET_MISMATCH"
+            )
 
         # -----------------------------------------------------
         # SCHEMA LINEAGE
@@ -594,41 +525,53 @@ async def promote(request: Request):
             evaluation.get("schemaDigest")
             != policy["schemaDigest"]
         ):
-            gates.add("SCHEMA_MISMATCH")
+
+            gates.add(
+                "SCHEMA_MISMATCH"
+            )
 
         # -----------------------------------------------------
-        # ACCURACY
+        # ACCURACY FLOOR
         # -----------------------------------------------------
 
         if (
-            accuracy_finite
+            finite(accuracy)
             and 0 <= accuracy <= 1
             and accuracy < policy["accuracyFloor"]
         ):
-            gates.add("ACCURACY_FLOOR")
+
+            gates.add(
+                "ACCURACY_FLOOR"
+            )
 
         # -----------------------------------------------------
-        # LATENCY
+        # LATENCY LIMIT
         # -----------------------------------------------------
 
         if (
-            latency_finite
+            finite(latency)
             and latency >= 0
             and latency > policy["maxLatencyMs"]
         ):
-            gates.add("LATENCY_LIMIT")
+
+            gates.add(
+                "LATENCY_LIMIT"
+            )
 
         # -----------------------------------------------------
-        # SIZE
+        # SIZE LIMIT
         # -----------------------------------------------------
 
         if (
             isinstance(size, int)
             and not isinstance(size, bool)
-            and 0 <= size <= SAFE_INT_MAX
+            and 0 <= size <= MAX_SAFE_INT
             and size > policy["maxSizeBytes"]
         ):
-            gates.add("SIZE_LIMIT")
+
+            gates.add(
+                "SIZE_LIMIT"
+            )
 
         # -----------------------------------------------------
         # REQUIRED SLICES
@@ -648,21 +591,25 @@ async def promote(request: Request):
             if name not in slices:
 
                 gates.add(
-                    "MISSING_SLICE:" + name
+                    f"MISSING_SLICE:{name}"
                 )
 
                 continue
 
             value = slices[name]
 
-            if (
-                not finite_number(value)
-                or value < 0
-                or value > 1
-            ):
+            if not finite(value):
 
                 gates.add(
-                    "SLICE_RANGE:" + name
+                    f"SLICE_RANGE:{name}"
+                )
+
+                continue
+
+            if value < 0 or value > 1:
+
+                gates.add(
+                    f"SLICE_RANGE:{name}"
                 )
 
                 continue
@@ -670,34 +617,36 @@ async def promote(request: Request):
             if value < floor:
 
                 gates.add(
-                    "SLICE_FLOOR:" + name
+                    f"SLICE_FLOOR:{name}"
                 )
 
         return gates
 
     # =========================================================
-    # EVALUATE ALL UNIQUE CANONICAL VERSIONS
+    # EVALUATE ALL UNIQUE VERSIONS
     # =========================================================
 
     eligible_items = []
 
     for version, item in lookup.items():
 
-        gates = validate(item)
+        gates = evaluate(item)
 
         if gates:
 
-            failed.setdefault(
+            add = failed.setdefault(
                 version,
                 set()
-            ).update(gates)
+            )
+
+            add.update(gates)
 
         else:
 
             eligible_items.append(item)
 
     # =========================================================
-    # CHAMPION EVIDENCE MUST BE VALID
+    # CHAMPION EVIDENCE
     # =========================================================
 
     champion_item = lookup.get(
@@ -706,18 +655,17 @@ async def promote(request: Request):
 
     if champion_item is None:
 
-        return response(
+        return make_response(
             "block",
             champion,
             None,
             [],
             failed,
-            input_versions,
             None,
             None
         )
 
-    champion_gates = validate(
+    champion_gates = evaluate(
         champion_item
     )
 
@@ -730,6 +678,7 @@ async def promote(request: Request):
             champion_gates
         )
 
+        # Rank only eligible versions.
         ranked = sorted(
             eligible_items,
             key=lambda item: (
@@ -740,7 +689,7 @@ async def promote(request: Request):
             )
         )
 
-        return response(
+        return make_response(
             "block",
             champion,
             None,
@@ -749,7 +698,6 @@ async def promote(request: Request):
                 for item in ranked
             ],
             failed,
-            input_versions,
             None,
             None
         )
@@ -759,12 +707,7 @@ async def promote(request: Request):
     )
 
     # =========================================================
-    # DETERMINISTIC ELIGIBLE RANKING
-    #
-    # accuracy DESC
-    # latency ASC
-    # size ASC
-    # numeric version ASC
+    # DETERMINISTIC RANKING
     # =========================================================
 
     ranked = sorted(
@@ -782,41 +725,36 @@ async def promote(request: Request):
         for item in ranked
     ]
 
-    # =========================================================
-    # CHAMPION IS BEST
-    # =========================================================
-
-    if ranked and ranked[0]["version"] == champion:
-
-        return response(
-            "retain",
-            champion,
-            champion,
-            eligible_versions,
-            failed,
-            input_versions,
-            None,
-            champion_evidence
-        )
-
-    # =========================================================
-    # NO OTHER ELIGIBLE MODEL
-    # =========================================================
-
+    # Champion must itself be eligible here.
     if not ranked:
 
-        return response(
+        return make_response(
             "retain",
             champion,
             champion,
             [],
             failed,
-            input_versions,
             None,
             champion_evidence
         )
 
     winner = ranked[0]
+
+    # =========================================================
+    # CHAMPION WINS
+    # =========================================================
+
+    if winner["version"] == champion:
+
+        return make_response(
+            "retain",
+            champion,
+            champion,
+            eligible_versions,
+            failed,
+            None,
+            champion_evidence
+        )
 
     # =========================================================
     # IMPROVEMENT
@@ -834,13 +772,12 @@ async def promote(request: Request):
 
     if improvement >= policy["minImprovement"]:
 
-        return response(
+        return make_response(
             "promote",
             champion,
             winner["version"],
             eligible_versions,
             failed,
-            input_versions,
             {
                 "alias": "champion",
                 "version": winner["version"]
@@ -852,13 +789,12 @@ async def promote(request: Request):
     # RETAIN
     # =========================================================
 
-    return response(
+    return make_response(
         "retain",
         champion,
         champion,
         eligible_versions,
         failed,
-        input_versions,
         None,
         champion_evidence
     )
